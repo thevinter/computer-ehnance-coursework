@@ -8,7 +8,7 @@ use std::fs::{self};
 use std::io::{self, Read};
 use std::path::Path;
 
-static DEBUG: bool = false;
+static DEBUG: bool = true;
 
 #[derive(Copy, Clone, Debug)]
 enum Opcode {
@@ -468,7 +468,11 @@ fn process_mov_irm(bytes: &[u8], size: u8) {
 
 fn process_mov_ir(bytes: &[u8], size: u8) {
     debug_bytes(bytes);
-    assert!(size == 3 || size == 4, "Invalid size for mov ir {}", size);
+    assert!(
+        size == 3 || size == 4 || size == 2,
+        "Invalid size for mov ir {}",
+        size
+    );
 
     let w = (bytes[0] >> 3) & 0b1;
     let reg = bytes[0] & 0b111;
