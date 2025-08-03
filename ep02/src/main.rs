@@ -1,3 +1,4 @@
+use core::panic;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::env;
@@ -7,16 +8,23 @@ use std::fs::{self};
 use std::io::{self, Read};
 use std::path::Path;
 
+static DEBUG: bool = false;
+
 #[derive(Copy, Clone, Debug)]
 enum Opcode {
-    MovRmR,
-    MovIR,
+    MovRmR, // Register or Memory to Register
+    MovIR,  // Immediate to Register
+    MovIRm, // Immediate to Register or Memory
+    MovAM,  // Accumulator to Memory
+    MovMA,  // Memory to Accumulator
 }
 
 impl fmt::Display for Opcode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Opcode::MovRmR | Opcode::MovIR => write!(f, "mov"),
+            Opcode::MovRmR | Opcode::MovIR | Opcode::MovIRm | Opcode::MovAM | Opcode::MovMA => {
+                write!(f, "mov")
+            }
         }
     }
 }
@@ -59,6 +67,9 @@ static OPCODE_TRIE: Lazy<BitTrie> = Lazy::new(|| {
     let mut trie = BitTrie::default();
     trie.insert(0b100010, 6, Opcode::MovRmR);
     trie.insert(0b1011, 4, Opcode::MovIR);
+    trie.insert(0b1100011, 7, Opcode::MovIRm);
+    trie.insert(0b1010001, 7, Opcode::MovAM);
+    trie.insert(0b1010000, 7, Opcode::MovMA);
     trie
 });
 
@@ -140,6 +151,7 @@ enum EAC {
     BPOrDA,
     BX,
 }
+
 impl fmt::Display for EAC {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -195,6 +207,17 @@ impl Reader {
     }
 }
 
+trait IteratorExt: Iterator<Item = u8> {
+    fn next_or_exit(&mut self, context: &str) -> u8 {
+        self.next().unwrap_or_else(|| {
+            eprintln!("Unexpected end of file while reading {}", context);
+            std::process::exit(1);
+        })
+    }
+}
+
+impl<I: Iterator<Item = u8>> IteratorExt for I {}
+
 impl Iterator for Reader {
     type Item = u8;
 
@@ -211,6 +234,7 @@ impl Iterator for Reader {
 
 fn main() {
     let mut args = env::args();
+
     args.next();
 
     let path = match args.next() {
@@ -246,57 +270,91 @@ fn main() {
             .match_bits(b0)
             .map(|(opcode, _)| opcode)
             .unwrap_or_else(|| {
-                eprintln!("Unknown opcode: {}", b0);
+                eprintln!("Unknown opcode: {:08b}", b0);
                 std::process::exit(1);
             });
 
         match opcode {
+            Opcode::MovMA => {
+                let mut bytes = vec![b0];
+
+                bytes.push(reader.next_or_exit("mov m-a addr_lo"));
+                bytes.push(reader.next_or_exit("mov m-a addr_hi"));
+
+                process_mov_ma(&bytes, bytes.len() as u8);
+            }
+            Opcode::MovAM => {
+                let mut bytes = vec![b0];
+
+                bytes.push(reader.next_or_exit("mov a-m addr_lo"));
+                bytes.push(reader.next_or_exit("mov a-m addr_hi"));
+
+                process_mov_am(&bytes, bytes.len() as u8);
+            }
             Opcode::MovRmR => {
-                let b1 = reader.next().unwrap_or_else(|| {
-                    eprintln!("Unexpected end of file while reading opcode");
-                    std::process::exit(1);
-                });
-                let mode = b1 >> 6;
-                if mode == 0b01 {
-                    let b2 = reader.next().unwrap_or_else(|| {
-                        eprintln!("Unexpected end of file while reading MOV RMR");
-                        std::process::exit(1);
-                    });
-                    //println!("Mode with {:08b},{:08b}, {:08b}, ", b0, b1, b2);
-                    process_mov_rmr(&[b0, b1, b2], 3);
-                } else if mode == 0b10 {
-                    let b2 = reader.next().unwrap_or_else(|| {
-                        eprintln!("Unexpected end of file while reading MOV RMR");
-                        std::process::exit(1);
-                    });
-                    let b3 = reader.next().unwrap_or_else(|| {
-                        eprintln!("Unexpected end of file while reading MOV RMR");
-                        std::process::exit(1);
-                    });
-                    //println!("Mode with {:08b},{:08b}, {:08b}, {:08b}", b0, b1, b2, b3);
-                    process_mov_rmr(&[b0, b1, b2, b3], 4);
+                let mut bytes = vec![b0];
+                bytes.push(reader.next_or_exit("mov rm-r b[1]"));
+
+                let mode = bytes[1] >> 6;
+                let displacement_registers = if mode == 0b11 {
+                    0
                 } else {
-                    //println!("Mode with {:08b},{:08b},", b0, b1,);
-                    process_mov_rmr(&[b0, b1], 2);
+                    // Special case for 16-bit displacement
+                    if mode == 0b00 && (bytes[1] & 0b111) == 0b110 {
+                        2
+                    } else {
+                        mode
+                    }
+                };
+
+                for _ in 0..displacement_registers {
+                    bytes.push(reader.next_or_exit("mov rm-r displ"));
                 }
+
+                process_mov_rmr(&bytes, bytes.len() as u8);
             }
             Opcode::MovIR => {
                 let w = (b0 >> 3) & 0b1;
-                let b1 = reader.next().unwrap_or_else(|| {
-                    eprintln!("Unexpected end of file while reading opcode");
-                    std::process::exit(1);
-                });
-                if w == 1 {
-                    let b2 = reader.next().unwrap_or_else(|| {
-                        eprintln!("Unexpected end of file while reading MOV IR");
-                        std::process::exit(1);
-                    });
-                    process_move_ir(&[b0, b1, b2], 3);
-                } else {
-                    process_move_ir(&[b0, b1], 2);
+                let mut bytes = vec![b0];
+
+                for _ in 0..w + 1 {
+                    bytes.push(reader.next_or_exit("mov i-r data"));
                 }
+
+                process_mov_ir(&bytes, bytes.len() as u8);
+            }
+            Opcode::MovIRm => {
+                let w = b0 & 0b1;
+                let mut bytes = vec![b0];
+                bytes.push(reader.next_or_exit("mov i-rm b[1]"));
+
+                let mode = bytes[1] >> 6;
+                let displacement_registers = if mode == 0b11 { 0 } else { mode };
+
+                for _ in 0..displacement_registers {
+                    bytes.push(reader.next_or_exit("mov i-rm displ"));
+                }
+
+                for _ in 0..w + 1 {
+                    bytes.push(reader.next_or_exit("mov i-rm data"));
+                }
+
+                process_mov_irm(&bytes, bytes.len() as u8);
             }
         };
+    }
+}
+
+fn debug_bytes(bytes: &[u8]) {
+    if DEBUG {
+        println!(
+            "Processing bytes: [{}]",
+            bytes
+                .iter()
+                .map(|b| format!("{:08b}", b))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 }
 
@@ -312,13 +370,113 @@ fn retrieve_register(index: u8, w: u8) -> Result<Register, String> {
         .ok_or_else(|| format!("Invalid register index: {}", index).into())
 }
 
-fn process_move_ir(bytes: &[u8], size: u8) {
+// Memory to Accumulator
+fn process_mov_ma(bytes: &[u8], size: u8) {
+    debug_bytes(bytes);
+    assert!(size == 3, "Invalid size for mov ma: {}", size);
+
+    let value = ((bytes[2] as i16) << 8) | (bytes[1] as i16);
+    println!("mov ax, [{}]", value);
+}
+
+// Accumulator to Memory
+fn process_mov_am(bytes: &[u8], size: u8) {
+    debug_bytes(bytes);
+    assert!(size == 3, "Invalid size for mov am: {}", size);
+
+    let value = ((bytes[2] as i16) << 8) | (bytes[1] as i16);
+    println!("mov [{}], ax", value);
+}
+
+// Immediate to Register or Memory
+fn process_mov_irm(bytes: &[u8], size: u8) {
+    debug_bytes(bytes);
+    assert!(size >= 3 && size <= 6, "Invalid size for mov irm: {}", size);
+
+    let w = (bytes[0] >> 3) & 0b1;
+    let reg = bytes[0] & 0b111;
+    let mode = bytes[1] >> 6;
+
+    let regormem = bytes[1] & 0b111;
+    match mode {
+        0b00 => {
+            // Immediate to memory
+            assert!(
+                size == 4 || size == 3,
+                "Invalid size for mov irm mode im to mem: {}",
+                size
+            );
+            let dest = EACS[regormem as usize];
+            let value = if size == 3 {
+                let _b = bytes[2] as i8;
+                _b as i16
+            } else {
+                ((bytes[3] as i16) << 8) | (bytes[2] as i16)
+            };
+            let size = if size == 3 { "byte" } else { "word" };
+            println!("mov [{}], {} {}", dest, size, value);
+        }
+
+        0b01 => {
+            // Immediate to memory with 8-bit displacement
+            assert!(
+                size == 4,
+                "Invalid size for mov irm mode im to mem + 8b: {}",
+                size
+            );
+            let dest = EACS[regormem as usize];
+            let displacement = bytes[2] as i8;
+            let value = bytes[3] as i8;
+            println!(
+                "mov [{} {}], word {}",
+                dest,
+                with_sign(displacement as i16),
+                value
+            );
+        }
+
+        0b10 => {
+            // Immediate to memory with 16-bit displacement
+            assert!(
+                size == 6,
+                "Invalid size for mov irm mode im to mem + 16b: {}",
+                size
+            );
+            let dest = EACS[regormem as usize];
+            let displacement = ((bytes[3] as i16) << 8) | (bytes[2] as i16);
+            let value = ((bytes[5] as i16) << 8) | (bytes[4] as i16);
+            println!("mov [{} {}], word {}", dest, with_sign(displacement), value);
+        }
+
+        0b11 => {
+            // Immediate to register
+            assert!(
+                size == 3,
+                "Invalid size for mov irm mode im to reg: {}",
+                size
+            );
+            let dest = retrieve_register(reg, w).expect("Failed to get destination register");
+            let value = ((bytes[2] as i16) << 8) | (bytes[1] as i16);
+            println!("mov {}, {}", dest, value);
+        }
+
+        _ => {
+            panic!("Unsupported mode: {:02b}", mode);
+        }
+    }
+}
+
+fn process_mov_ir(bytes: &[u8], size: u8) {
+    debug_bytes(bytes);
+    assert!(size == 3 || size == 4, "Invalid size for mov ir {}", size);
+
     let w = (bytes[0] >> 3) & 0b1;
     let reg = bytes[0] & 0b111;
     let value = if size == 3 {
         ((bytes[2] as i16) << 8) | (bytes[1] as i16)
     } else {
-        bytes[1] as i16
+        let _b = bytes[1] as i8;
+        _b as i16
     };
 
     let dest = retrieve_register(reg, w).expect("Failed to get destination register");
@@ -327,7 +485,9 @@ fn process_move_ir(bytes: &[u8], size: u8) {
 }
 
 fn process_mov_rmr(bytes: &[u8], size: u8) {
-    assert!(size >= 2);
+    debug_bytes(bytes);
+    assert!(size >= 2 && size <= 4, "Invalid size for mov rmr: {}", size);
+
     let d = (bytes[0] >> 1) & 0b1;
     let w = bytes[0] & 0b1;
 
@@ -335,49 +495,69 @@ fn process_mov_rmr(bytes: &[u8], size: u8) {
     let reg = (bytes[1] >> 3) & 0b111;
     let regormem = bytes[1] & 0b111;
 
-    if mode == 0b00 {
-        let source = EACS[regormem as usize];
-        let dest = retrieve_register(reg, w).expect("Failed to get source register");
-        if d == 1 {
-            println!("mov {}, [{}]", dest, source);
-        } else {
-            println!("mov [{}], {}", source, dest);
+    match mode {
+        0b00 => {
+            let source = if regormem == 0b110 {
+                (((bytes[3] as i16) << 8) | (bytes[2] as i16)).to_string()
+            } else {
+                EACS[regormem as usize].to_string()
+            };
+            let dest = retrieve_register(reg, w).expect("Failed to get source register");
+            if d == 1 {
+                println!("mov {}, [{}]", dest, source);
+            } else {
+                println!("mov [{}], {}", source, dest);
+            }
         }
-    } else if mode == 0b01 {
-        assert!(size == 3);
-        let source = EACS[regormem as usize];
-        let dest = retrieve_register(reg, w).expect("Failed to get source register");
-        let displacement = bytes[2] as i8;
-        if d == 1 {
-            println!("mov {}, [{} + {}]", dest, source, displacement);
-        } else {
-            println!("mov [{} + {}], {}", source, displacement, dest);
-        }
-    } else if mode == 0b10 {
-        assert!(size == 4);
-        let source = EACS[regormem as usize];
-        let dest = retrieve_register(reg, w).expect("Failed to get source register");
-        let displacement = ((bytes[3] as i16) << 8) | (bytes[2] as i16);
-        if d == 1 {
-            println!("mov {}, [{} + {}]", dest, source, displacement);
-        } else {
-            println!("mov [{} + {}], {}", source, displacement, dest);
-        }
-    } else {
-        let (source, destination) = if d == 0 {
-            // MOV from register/memory to register
-            (
-                retrieve_register(regormem, w).expect("Failed to get source register"),
-                retrieve_register(reg, w).expect("Failed to get destination register"),
-            )
-        } else {
-            // MOV from register to register/memory
-            (
-                retrieve_register(reg, w).expect("Failed to get source register"),
-                retrieve_register(regormem, w).expect("Failed to get destination register"),
-            )
-        };
 
-        println!("mov {}, {}", source, destination);
+        0b01 => {
+            assert!(size == 3);
+            let source = EACS[regormem as usize];
+            let dest = retrieve_register(reg, w).expect("Failed to get source register");
+            let _disp = bytes[2] as i8;
+            let displacement = _disp as i16;
+            if d == 1 {
+                println!("mov {}, [{} {}]", dest, source, with_sign(displacement));
+            } else {
+                println!("mov [{} {}], {}", source, with_sign(displacement), dest);
+            }
+        }
+
+        0b10 => {
+            assert!(size == 4);
+            let source = EACS[regormem as usize];
+            let dest = retrieve_register(reg, w).expect("Failed to get source register");
+            let displacement = ((bytes[3] as i16) << 8) | (bytes[2] as i16);
+            if d == 1 {
+                println!("mov {}, [{} {}]", dest, source, with_sign(displacement));
+            } else {
+                println!("mov [{} {}], {}", source, with_sign(displacement), dest);
+            }
+        }
+
+        0b11 => {
+            let (source, destination) = if d == 0 {
+                (
+                    retrieve_register(regormem, w).expect("Failed to get source register"),
+                    retrieve_register(reg, w).expect("Failed to get destination register"),
+                )
+            } else {
+                (
+                    retrieve_register(reg, w).expect("Failed to get source register"),
+                    retrieve_register(regormem, w).expect("Failed to get destination register"),
+                )
+            };
+            println!("mov {}, {}", source, destination);
+        }
+
+        _ => panic!("Invalid mode: {:02b}", mode),
+    }
+}
+
+fn with_sign(n: i16) -> String {
+    if n >= 0 {
+        format!("+ {}", n)
+    } else {
+        format!("- {}", -n)
     }
 }
