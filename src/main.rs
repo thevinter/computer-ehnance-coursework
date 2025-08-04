@@ -7,9 +7,9 @@ mod opcodes;
 mod registers;
 mod utility;
 
-use opcodes::{Opcode, OPCODE_TRIE};
-use registers::{retrieve_register, Register, EAC, EACS, REGISTERS};
-use utility::{debug_bytes, read_file, BitTrie, IteratorExt, Reader};
+use opcodes::{OPCODE_TRIE, Opcode};
+use registers::{EAC, EACS, REGISTERS, Register, retrieve_register};
+use utility::{BitTrie, IteratorExt, Reader, debug_bytes, read_file};
 
 static DEBUG: bool = true;
 
@@ -72,28 +72,6 @@ fn main() {
 
                 process_mov_am(&bytes, bytes.len() as u8);
             }
-            Opcode::MovRmR => {
-                let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("mov rm-r b[1]"));
-
-                let mode = bytes[1] >> 6;
-                let displacement_registers = if mode == 0b11 {
-                    0
-                } else {
-                    // Special case for 16-bit displacement
-                    if mode == 0b00 && (bytes[1] & 0b111) == 0b110 {
-                        2
-                    } else {
-                        mode
-                    }
-                };
-
-                for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("mov rm-r displ"));
-                }
-
-                process_rmr(&bytes, bytes.len() as u8, Opcode::MovRmR);
-            }
             Opcode::MovIR => {
                 let w = (b0 >> 3) & 0b1;
                 let mut bytes = vec![b0];
@@ -122,9 +100,44 @@ fn main() {
 
                 process_irm(&bytes, bytes.len() as u8, Opcode::MovIRm);
             }
-            Opcode::AddRmR => {
+            Opcode::AddIRm | Opcode::SubIRm | Opcode::CmpIRm => {
+                let w = b0 & 0b1;
+                let s = (b0 >> 1) & 0b1;
                 let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("add rm-r b[1]"));
+                bytes.push(reader.next_or_exit("add i-rm b[1]"));
+
+                let regormem = bytes[1] & 0b111;
+
+                let mode = bytes[1] >> 6;
+                let displacement_registers = if mode == 0b11 {
+                    0
+                } else {
+                    if regormem == 0b110 { 2 } else { mode }
+                };
+
+                for _ in 0..displacement_registers {
+                    bytes.push(reader.next_or_exit("add i-rm displ"));
+                }
+
+                for _ in 0..(w + 1 - s) {
+                    bytes.push(reader.next_or_exit("add i-rm data"));
+                }
+
+                process_irm(&bytes, bytes.len() as u8, opcode);
+            }
+            Opcode::AddIA | Opcode::SubIA | Opcode::CmpIA => {
+                let w = b0 & 0b1;
+                let mut bytes = vec![b0];
+
+                for _ in 0..w + 1 {
+                    bytes.push(reader.next_or_exit("mov i-r data"));
+                }
+
+                process_ir(&bytes, bytes.len() as u8, opcode);
+            }
+            Opcode::SubRmR | Opcode::AddRmR | Opcode::CmpRmR | Opcode::MovRmR => {
+                let mut bytes = vec![b0];
+                bytes.push(reader.next_or_exit("sub rm-r b[1]"));
 
                 let mode = bytes[1] >> 6;
                 let displacement_registers = if mode == 0b11 {
@@ -139,39 +152,36 @@ fn main() {
                 };
 
                 for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("add rm-r displ"));
+                    bytes.push(reader.next_or_exit("{} rm-r displ"));
                 }
 
-                process_rmr(&bytes, bytes.len() as u8, Opcode::AddRmR);
+                process_rmr(&bytes, bytes.len() as u8, opcode);
             }
-            Opcode::AddIRm => {
-                let w = b0 & 0b1;
-                let s = (b0 >> 1) & 0b1;
+            Opcode::Je
+            | Opcode::Jl
+            | Opcode::Jle
+            | Opcode::Jb
+            | Opcode::Jbe
+            | Opcode::Jp
+            | Opcode::Jo
+            | Opcode::Js
+            | Opcode::Jne
+            | Opcode::Jnl
+            | Opcode::Jg
+            | Opcode::Jnb
+            | Opcode::Ja
+            | Opcode::Jnp
+            | Opcode::Jno
+            | Opcode::Jns
+            | Opcode::Loop
+            | Opcode::Loopz
+            | Opcode::Loopnz
+            | Opcode::Jcxz => {
                 let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("add i-rm b[1]"));
 
-                let mode = bytes[1] >> 6;
-                let displacement_registers = if mode == 0b11 { 0 } else { mode };
+                bytes.push(reader.next_or_exit("jmp ip-inc8"));
 
-                for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("add i-rm displ"));
-                }
-
-                for _ in 0..(w + 1 - s) {
-                    bytes.push(reader.next_or_exit("add i-rm data"));
-                }
-
-                process_irm(&bytes, bytes.len() as u8, Opcode::AddIRm);
-            }
-            Opcode::AddIA => {
-                let w = b0 & 0b1;
-                let mut bytes = vec![b0];
-
-                for _ in 0..w + 1 {
-                    bytes.push(reader.next_or_exit("mov i-r data"));
-                }
-
-                process_ir(&bytes, bytes.len() as u8, Opcode::AddIA);
+                process_jmp(&bytes, bytes.len() as u8, opcode);
             }
         };
     }
@@ -187,27 +197,60 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
     );
 
     let w = bytes[0] & 0b1;
-    let reg = bytes[1] & 0b111;
+    let reg = (bytes[1] >> 3) & 0b111;
     let mode = bytes[1] >> 6;
 
     let regormem = bytes[1] & 0b111;
+
+    let is_arithmetic = op == Opcode::AddIRm || op == Opcode::SubIRm || op == Opcode::CmpIRm;
+    let s = if is_arithmetic {
+        (bytes[0] >> 1) & 0b1
+    } else {
+        0
+    };
+
+    //println!("reg {:03b}, opcode: {}", reg, op);
+    let op = if op == Opcode::AddIRm {
+        match reg {
+            0b101 => Opcode::SubIRm,
+            0b000 => Opcode::AddIRm,
+            0b111 => Opcode::CmpIRm,
+            _ => panic!("Invalid reg for AddRmR: {}", regormem),
+        }
+    } else {
+        op
+    };
+
     match mode {
         0b00 => {
             // Immediate to memory
             assert!(
-                size == 4 || size == 3,
+                size == 4 || size == 3 || size == 5,
                 "Invalid size for {} irm mode im to mem: {}",
                 op,
                 size
             );
-            let dest = EACS[regormem as usize];
             let value = if size == 3 {
                 let _b = bytes[2] as i8;
                 _b as i16
             } else {
                 ((bytes[3] as i16) << 8) | (bytes[2] as i16)
             };
-            let size = if size == 3 { "byte" } else { "word" };
+            let dest = if regormem == 0b110 {
+                &value.to_string()
+            } else {
+                &EACS[regormem as usize].to_string()
+            };
+            let value = if size == 3 {
+                let _b = bytes[2] as i8;
+                _b as i16
+            } else if size == 5 {
+                let _b = bytes[4] as i8;
+                _b as i16
+            } else {
+                ((bytes[3] as i16) << 8) | (bytes[2] as i16)
+            };
+            let size = if size + s == 3 { "byte" } else { "word" };
             println!("{} [{}], {} {}", op, dest, size, value);
         }
 
@@ -241,7 +284,7 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
             );
             let dest = EACS[regormem as usize];
             let displacement = ((bytes[3] as i16) << 8) | (bytes[2] as i16);
-            let value = if op == Opcode::AddIRm {
+            let value = if is_arithmetic {
                 bytes[4] as i16
             } else {
                 ((bytes[5] as i16) << 8) | (bytes[4] as i16)
@@ -263,8 +306,8 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
                 op,
                 size
             );
-            let dest = retrieve_register(reg, w).expect("Failed to get destination register");
-            let value = if op == Opcode::AddIRm {
+            let dest = retrieve_register(regormem, w).expect("Failed to get destination register");
+            let value = if is_arithmetic {
                 bytes[2] as i16
             } else {
                 ((bytes[2] as i16) << 8) | (bytes[1] as i16)
@@ -369,6 +412,14 @@ fn process_mov_am(bytes: &[u8], size: u8) {
     println!("mov [{}], ax", value);
 }
 
+fn process_jmp(bytes: &[u8], size: u8, op: Opcode) {
+    debug_bytes(bytes);
+    assert!(size == 2, "Invalid size for mov am: {}", size);
+
+    let value = bytes[1] as i8;
+    println!("{} {}", op, value);
+}
+
 fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
     debug_bytes(bytes);
     assert!(
@@ -378,7 +429,9 @@ fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
         size
     );
 
-    let w = if (op == Opcode::AddIA) {
+    let is_arithmetic = op == Opcode::AddIA || op == Opcode::SubIA || op == Opcode::CmpIA;
+
+    let w = if op == Opcode::AddIA {
         bytes[0] & 0b1
     } else {
         (bytes[0] >> 3) & 0b1
@@ -391,12 +444,8 @@ fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
         _b as i16
     };
 
-    let dest = if op == Opcode::AddIA {
-        if size == 3 {
-            "ax"
-        } else {
-            "al"
-        }
+    let dest = if is_arithmetic {
+        if size == 3 { "ax" } else { "al" }
     } else {
         &retrieve_register(reg, w)
             .expect("Failed to get destination register")
@@ -404,23 +453,6 @@ fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
     };
 
     println!("{} {}, {}", op, dest, value);
-}
-fn process_mov_ir(bytes: &[u8], size: u8) {
-    debug_bytes(bytes);
-    assert!(size == 3 || size == 2, "Invalid size for mov ir {}", size);
-
-    let w = (bytes[0] >> 3) & 0b1;
-    let reg = bytes[0] & 0b111;
-    let value = if size == 3 {
-        ((bytes[2] as i16) << 8) | (bytes[1] as i16)
-    } else {
-        let _b = bytes[1] as i8;
-        _b as i16
-    };
-
-    let dest = retrieve_register(reg, w).expect("Failed to get destination register");
-
-    println!("mov {}, {}", dest, value);
 }
 
 fn with_sign(n: i16) -> String {

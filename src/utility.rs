@@ -92,7 +92,7 @@ impl Iterator for Reader {
 }
 
 pub fn debug_bytes(bytes: &[u8]) {
-    static DEBUG: bool = true;
+    static DEBUG: bool = false;
     if DEBUG {
         println!(
             "; Processing bytes: [{}]",
