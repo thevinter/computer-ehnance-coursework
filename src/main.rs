@@ -1,26 +1,17 @@
 use core::panic;
-use once_cell::sync::Lazy;
 use std::env;
 use std::fs::{self};
 use std::io::{self};
 
-mod structures;
-use structures::{BitTrie, IteratorExt, Opcode, Reader, Register, EAC, EACS, REGISTERS};
+mod opcodes;
+mod registers;
+mod utility;
+
+use opcodes::{Opcode, OPCODE_TRIE};
+use registers::{retrieve_register, Register, EAC, EACS, REGISTERS};
+use utility::{debug_bytes, read_file, BitTrie, IteratorExt, Reader};
 
 static DEBUG: bool = true;
-
-static OPCODE_TRIE: Lazy<BitTrie> = Lazy::new(|| {
-    let mut trie = BitTrie::default();
-    trie.insert(0b100010, 6, Opcode::MovRmR);
-    trie.insert(0b1011, 4, Opcode::MovIR);
-    trie.insert(0b1100011, 7, Opcode::MovIRm);
-    trie.insert(0b1010001, 7, Opcode::MovAM);
-    trie.insert(0b1010000, 7, Opcode::MovMA);
-    trie.insert(0b000000, 6, Opcode::AddRmR);
-    trie.insert(0b100000, 6, Opcode::AddIRm);
-    trie.insert(0b0000010, 7, Opcode::AddIA);
-    trie
-});
 
 fn main() {
     let mut args = env::args();
@@ -184,31 +175,6 @@ fn main() {
             }
         };
     }
-}
-
-fn debug_bytes(bytes: &[u8]) {
-    if DEBUG {
-        println!(
-            "Processing bytes: [{}]",
-            bytes
-                .iter()
-                .map(|b| format!("{:08b}", b))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-}
-
-fn read_file(path: &str) -> Result<Vec<u8>, String> {
-    fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", path, e))
-}
-
-fn retrieve_register(index: u8, w: u8) -> Result<Register, String> {
-    REGISTERS
-        .get(w as usize)
-        .and_then(|row| row.get(index as usize))
-        .copied()
-        .ok_or_else(|| format!("Invalid register index: {}", index).into())
 }
 
 fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
