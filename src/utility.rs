@@ -95,7 +95,7 @@ pub fn debug_bytes(bytes: &[u8]) {
     static DEBUG: bool = true;
     if DEBUG {
         println!(
-            "Processing bytes: [{}]",
+            "; Processing bytes: [{}]",
             bytes
                 .iter()
                 .map(|b| format!("{:08b}", b))
