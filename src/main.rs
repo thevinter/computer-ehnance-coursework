@@ -1,22 +1,32 @@
 use core::panic;
-use std::env;
-use std::fs::{self};
-use std::io::{self};
+use std::{env, result};
 
 mod opcodes;
 mod registers;
 mod utility;
 
 use opcodes::{OPCODE_TRIE, Opcode};
-use registers::{EAC, EACS, REGISTERS, Register, retrieve_register};
-use utility::{BitTrie, IteratorExt, Reader, debug_bytes, read_file};
+use registers::{EACS, RegisterFile, retrieve_register};
+use utility::{DEBUG, IteratorExt, Reader, debug_bytes, read_file};
 
-static DEBUG: bool = true;
+use crate::registers::Register;
+use crate::utility::{print_memory_16bit, print_memory_hex};
+
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if utility::DEBUG {
+            println!($($arg)*);
+        }
+    };
+}
 
 fn main() {
     let mut args = env::args();
 
     args.next();
+
+    let mut memory = RegisterFile::new();
+    print_memory_16bit(&memory.raw_memory());
 
     let path = match args.next() {
         Some(arg) => arg,
@@ -80,7 +90,7 @@ fn main() {
                     bytes.push(reader.next_or_exit("mov i-r data"));
                 }
 
-                process_ir(&bytes, bytes.len() as u8, Opcode::MovIR);
+                process_ir(&bytes, bytes.len() as u8, Opcode::MovIR, &mut memory);
             }
             Opcode::MovIRm => {
                 let w = b0 & 0b1;
@@ -98,7 +108,7 @@ fn main() {
                     bytes.push(reader.next_or_exit("mov i-rm data"));
                 }
 
-                process_irm(&bytes, bytes.len() as u8, Opcode::MovIRm);
+                process_irm(&bytes, bytes.len() as u8, Opcode::MovIRm, &mut memory);
             }
             Opcode::AddIRm | Opcode::SubIRm | Opcode::CmpIRm => {
                 let w = b0 & 0b1;
@@ -123,7 +133,7 @@ fn main() {
                     bytes.push(reader.next_or_exit("add i-rm data"));
                 }
 
-                process_irm(&bytes, bytes.len() as u8, opcode);
+                process_irm(&bytes, bytes.len() as u8, opcode, &mut memory);
             }
             Opcode::AddIA | Opcode::SubIA | Opcode::CmpIA => {
                 let w = b0 & 0b1;
@@ -133,7 +143,7 @@ fn main() {
                     bytes.push(reader.next_or_exit("mov i-r data"));
                 }
 
-                process_ir(&bytes, bytes.len() as u8, opcode);
+                process_ir(&bytes, bytes.len() as u8, opcode, &mut memory);
             }
             Opcode::SubRmR | Opcode::AddRmR | Opcode::CmpRmR | Opcode::MovRmR => {
                 let mut bytes = vec![b0];
@@ -155,7 +165,7 @@ fn main() {
                     bytes.push(reader.next_or_exit("{} rm-r displ"));
                 }
 
-                process_rmr(&bytes, bytes.len() as u8, opcode);
+                process_rmr(&bytes, bytes.len() as u8, opcode, &mut memory);
             }
             Opcode::Je
             | Opcode::Jl
@@ -184,10 +194,12 @@ fn main() {
                 process_jmp(&bytes, bytes.len() as u8, opcode);
             }
         };
+        println!();
     }
 }
 
-fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
+fn process_irm(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
+    debug!("; Processing irm:");
     debug_bytes(bytes);
     assert!(
         size >= 3 && size <= 6,
@@ -199,7 +211,6 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
     let w = bytes[0] & 0b1;
     let reg = (bytes[1] >> 3) & 0b111;
     let mode = bytes[1] >> 6;
-
     let regormem = bytes[1] & 0b111;
 
     let is_arithmetic = op == Opcode::AddIRm || op == Opcode::SubIRm || op == Opcode::CmpIRm;
@@ -220,6 +231,10 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
     } else {
         op
     };
+    debug!(
+        "; Processing {} with mode {:02b}, reg: {:03b}, regormem: {:03b}, w = {}, s = {}",
+        op, mode, reg, regormem, w, s
+    );
 
     match mode {
         0b00 => {
@@ -307,11 +322,20 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
                 size
             );
             let dest = retrieve_register(regormem, w).expect("Failed to get destination register");
-            let value = if is_arithmetic {
-                bytes[2] as i16
+
+            let value = if s == 1 && w == 1 {
+                bytes[2] as i8 as i16 // sign-extend 8-bit immediate
+            } else if w == 0 {
+                bytes[2] as i8 as i16 // also sign-extend for 8-bit ops
             } else {
-                ((bytes[2] as i16) << 8) | (bytes[1] as i16)
+                (bytes[3] as i16) << 8 | (bytes[2] as i16)
             };
+
+            if is_arithmetic {
+                perform_arithmetic(op, dest, value, memory);
+            } else {
+                move_data(dest, value, memory);
+            }
             println!("{} {}, {}", op, dest, value);
         }
 
@@ -321,7 +345,8 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
     }
 }
 
-fn process_rmr(bytes: &[u8], size: u8, op: Opcode) {
+fn process_rmr(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
+    debug!("; Processing rmr:");
     debug_bytes(bytes);
     assert!(
         size >= 2 && size <= 4,
@@ -336,6 +361,8 @@ fn process_rmr(bytes: &[u8], size: u8, op: Opcode) {
     let mode = bytes[1] >> 6;
     let reg = (bytes[1] >> 3) & 0b111;
     let regormem = bytes[1] & 0b111;
+
+    let is_arithmetic = op == Opcode::AddRmR || op == Opcode::SubRmR || op == Opcode::CmpRmR;
 
     match mode {
         0b00 => {
@@ -378,7 +405,7 @@ fn process_rmr(bytes: &[u8], size: u8, op: Opcode) {
         }
 
         0b11 => {
-            let (source, destination) = if d == 0 {
+            let (source, destination) = if d == 1 {
                 (
                     retrieve_register(regormem, w).expect("Failed to get source register"),
                     retrieve_register(reg, w).expect("Failed to get destination register"),
@@ -389,7 +416,13 @@ fn process_rmr(bytes: &[u8], size: u8, op: Opcode) {
                     retrieve_register(regormem, w).expect("Failed to get destination register"),
                 )
             };
-            println!("{} {}, {}", op, source, destination);
+            if is_arithmetic {
+                perform_arithmetic(op, destination, memory.get(source) as i16, memory);
+            } else {
+                move_data(destination, memory.get(source) as i16, memory);
+            }
+
+            println!("{} {}, {}", op, destination, source);
         }
 
         _ => panic!("Invalid mode: {:02b}", mode),
@@ -397,6 +430,7 @@ fn process_rmr(bytes: &[u8], size: u8, op: Opcode) {
 }
 
 fn process_mov_ma(bytes: &[u8], size: u8) {
+    debug!("; Processing mov ma:");
     debug_bytes(bytes);
     assert!(size == 3, "Invalid size for mov ma: {}", size);
 
@@ -405,6 +439,7 @@ fn process_mov_ma(bytes: &[u8], size: u8) {
 }
 
 fn process_mov_am(bytes: &[u8], size: u8) {
+    debug!("; Processing mov am:");
     debug_bytes(bytes);
     assert!(size == 3, "Invalid size for mov am: {}", size);
 
@@ -420,7 +455,8 @@ fn process_jmp(bytes: &[u8], size: u8, op: Opcode) {
     println!("{} {}", op, value);
 }
 
-fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
+fn process_ir(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
+    debug!("; Processing ir:");
     debug_bytes(bytes);
     assert!(
         size == 3 || size == 2,
@@ -445,14 +481,17 @@ fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
     };
 
     let dest = if is_arithmetic {
-        if size == 3 { "ax" } else { "al" }
+        if size == 3 {
+            Register::AX
+        } else {
+            Register::AL
+        }
     } else {
-        &retrieve_register(reg, w)
-            .expect("Failed to get destination register")
-            .to_string()
+        retrieve_register(reg, w).expect("Failed to get destination register")
     };
 
     println!("{} {}, {}", op, dest, value);
+    move_data(dest, value, memory);
 }
 
 fn with_sign(n: i16) -> String {
@@ -461,4 +500,30 @@ fn with_sign(n: i16) -> String {
     } else {
         format!("- {}", -n)
     }
+}
+
+fn move_data(dest: Register, value: i16, memory: &mut RegisterFile) {
+    debug!("; Moving data: {:016b} to {}", value, dest);
+    memory.set(dest, value as u16);
+    if DEBUG {
+        print_memory_hex(&memory.raw_memory());
+    }
+}
+
+fn perform_arithmetic(op: Opcode, dest: Register, value: i16, memory: &mut RegisterFile) {
+    let current_value = memory.get(dest) as i16;
+    let result = match op {
+        Opcode::AddRmR | Opcode::AddIA | Opcode::AddIRm => current_value + value,
+        Opcode::SubRmR | Opcode::SubIA | Opcode::SubIRm => current_value - value,
+        Opcode::CmpRmR | Opcode::CmpIA | Opcode::CmpIRm => current_value - value,
+
+        _ => panic!("Unsupported arithmetic operation: {:?}", op),
+    };
+    memory.set_flags_from_result(result);
+    if DEBUG {
+        memory.print_flags();
+    }
+    if op != Opcode::CmpRmR {
+        move_data(dest, result, memory)
+    };
 }

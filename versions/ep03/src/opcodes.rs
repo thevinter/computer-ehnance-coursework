@@ -1,6 +1,6 @@
 use crate::utility::BitTrie;
 use once_cell::sync::Lazy;
-use std::fmt::{self};
+use std::fmt::{self, write};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Opcode {

@@ -1,243 +1,17 @@
 use core::panic;
-use once_cell::sync::Lazy;
-use std::collections::HashMap;
 use std::env;
-use std::fmt;
-use std::fs::File;
 use std::fs::{self};
-use std::io::{self, Read};
-use std::path::Path;
+use std::io::{self};
+
+mod opcodes;
+mod registers;
+mod utility;
+
+use opcodes::{OPCODE_TRIE, Opcode};
+use registers::{EAC, EACS, REGISTERS, Register, retrieve_register};
+use utility::{BitTrie, IteratorExt, Reader, debug_bytes, read_file};
 
 static DEBUG: bool = true;
-
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum Opcode {
-    MovRmR, // Register or Memory to Register
-    MovIR,  // Immediate to Register
-    MovIRm, // Immediate to Register or Memory
-    MovAM,  // Accumulator to Memory
-    MovMA,  // Memory to Accumulator
-    AddRmR,
-    AddIRm,
-    AddIA,
-}
-
-impl fmt::Display for Opcode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Opcode::MovRmR | Opcode::MovIR | Opcode::MovIRm | Opcode::MovAM | Opcode::MovMA => {
-                write!(f, "mov")
-            }
-            Opcode::AddRmR | Opcode::AddIRm | Opcode::AddIA => write!(f, "add"),
-        }
-    }
-}
-
-#[derive(Default)]
-struct BitTrie {
-    value: Option<Opcode>,
-    children: HashMap<u8, BitTrie>,
-}
-
-impl BitTrie {
-    fn insert(&mut self, bits: u8, len: u8, val: Opcode) {
-        let mut node = self;
-        for i in (0..len).rev() {
-            let bit = (bits >> i) & 1;
-            node = node.children.entry(bit).or_default();
-        }
-        node.value = Some(val);
-    }
-
-    fn match_bits(&self, byte: u8) -> Option<(Opcode, u8)> {
-        let mut node = self;
-        for i in (0..8).rev() {
-            let bit = (byte >> i) & 1;
-            if let Some(next) = node.children.get(&bit) {
-                node = next;
-                if let Some(val) = node.value {
-                    let matched_len = 8 - i;
-                    return Some((val, matched_len));
-                }
-            } else {
-                break;
-            }
-        }
-        None
-    }
-}
-
-static OPCODE_TRIE: Lazy<BitTrie> = Lazy::new(|| {
-    let mut trie = BitTrie::default();
-    trie.insert(0b100010, 6, Opcode::MovRmR);
-    trie.insert(0b1011, 4, Opcode::MovIR);
-    trie.insert(0b1100011, 7, Opcode::MovIRm);
-    trie.insert(0b1010001, 7, Opcode::MovAM);
-    trie.insert(0b1010000, 7, Opcode::MovMA);
-    trie.insert(0b000000, 6, Opcode::AddRmR);
-    trie.insert(0b100000, 6, Opcode::AddIRm);
-    trie.insert(0b0000010, 7, Opcode::AddIA);
-    trie
-});
-
-#[derive(Copy, Clone, Debug)]
-enum Register {
-    AL,
-    CL,
-    DL,
-    BL,
-    AH,
-    CH,
-    DH,
-    BH,
-    AX,
-    CX,
-    DX,
-    BX,
-    SP,
-    BP,
-    SI,
-    DI,
-}
-
-impl fmt::Display for Register {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            Register::AL => "al",
-            Register::CL => "cl",
-            Register::DL => "dl",
-            Register::BL => "bl",
-            Register::AH => "ah",
-            Register::CH => "ch",
-            Register::DH => "dh",
-            Register::BH => "bh",
-            Register::AX => "ax",
-            Register::CX => "cx",
-            Register::DX => "dx",
-            Register::BX => "bx",
-            Register::SP => "sp",
-            Register::BP => "bp",
-            Register::SI => "si",
-            Register::DI => "di",
-        };
-        write!(f, "{}", s)
-    }
-}
-
-static REGISTERS: [[Register; 8]; 2] = [
-    [
-        Register::AL, // 0b000
-        Register::CL, // 0b001
-        Register::DL, // 0b010
-        Register::BL, // 0b011
-        Register::AH, // 0b100
-        Register::CH, // 0b101
-        Register::DH, // 0b110
-        Register::BH, // 0b111
-    ],
-    [
-        Register::AX,
-        Register::CX,
-        Register::DX,
-        Register::BX,
-        Register::SP,
-        Register::BP,
-        Register::SI,
-        Register::DI,
-    ],
-];
-
-#[derive(Copy, Clone)]
-enum EAC {
-    BXSI,
-    BXDI,
-    BPSI,
-    BPDI,
-    SI,
-    DI,
-    BPOrDA,
-    BX,
-}
-
-impl fmt::Display for EAC {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            EAC::BXSI => "bx + si",
-            EAC::BXDI => "bx + di",
-            EAC::BPSI => "bp + si",
-            EAC::BPDI => "bp + di",
-            EAC::SI => "si",
-            EAC::DI => "di",
-            EAC::BPOrDA => "bp",
-            EAC::BX => "bx",
-        };
-        write!(f, "{}", s)
-    }
-}
-
-static EACS: [EAC; 8] = [
-    EAC::BXSI,   // 0b00
-    EAC::BXDI,   // 0b01
-    EAC::BPSI,   // 0b10
-    EAC::BPDI,   // 0b11
-    EAC::SI,     // 0b100
-    EAC::DI,     // 0b101
-    EAC::BPOrDA, // 0b110
-    EAC::BX,     // 0b111
-];
-
-struct Reader {
-    buffer: Vec<u8>,
-    pos: usize,
-}
-
-impl Reader {
-    fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let mut file = File::open(path)?;
-        let mut buffer = Vec::new();
-        file.read_to_end(&mut buffer)?;
-        Ok(Self { buffer, pos: 0 })
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.buffer.get(self.pos).copied()
-    }
-
-    fn read_n(&mut self, n: usize) -> Option<&[u8]> {
-        if self.pos + n <= self.buffer.len() {
-            let chunk = &self.buffer[self.pos..self.pos + n];
-            self.pos += n;
-            Some(chunk)
-        } else {
-            None
-        }
-    }
-}
-
-trait IteratorExt: Iterator<Item = u8> {
-    fn next_or_exit(&mut self, context: &str) -> u8 {
-        self.next().unwrap_or_else(|| {
-            eprintln!("Unexpected end of file while reading {}", context);
-            std::process::exit(1);
-        })
-    }
-}
-
-impl<I: Iterator<Item = u8>> IteratorExt for I {}
-
-impl Iterator for Reader {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.pos < self.buffer.len() {
-            let byte = self.buffer[self.pos];
-            self.pos += 1;
-            Some(byte)
-        } else {
-            None
-        }
-    }
-}
 
 fn main() {
     let mut args = env::args();
@@ -298,28 +72,6 @@ fn main() {
 
                 process_mov_am(&bytes, bytes.len() as u8);
             }
-            Opcode::MovRmR => {
-                let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("mov rm-r b[1]"));
-
-                let mode = bytes[1] >> 6;
-                let displacement_registers = if mode == 0b11 {
-                    0
-                } else {
-                    // Special case for 16-bit displacement
-                    if mode == 0b00 && (bytes[1] & 0b111) == 0b110 {
-                        2
-                    } else {
-                        mode
-                    }
-                };
-
-                for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("mov rm-r displ"));
-                }
-
-                process_rmr(&bytes, bytes.len() as u8, Opcode::MovRmR);
-            }
             Opcode::MovIR => {
                 let w = (b0 >> 3) & 0b1;
                 let mut bytes = vec![b0];
@@ -348,9 +100,44 @@ fn main() {
 
                 process_irm(&bytes, bytes.len() as u8, Opcode::MovIRm);
             }
-            Opcode::AddRmR => {
+            Opcode::AddIRm | Opcode::SubIRm | Opcode::CmpIRm => {
+                let w = b0 & 0b1;
+                let s = (b0 >> 1) & 0b1;
                 let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("add rm-r b[1]"));
+                bytes.push(reader.next_or_exit("add i-rm b[1]"));
+
+                let regormem = bytes[1] & 0b111;
+
+                let mode = bytes[1] >> 6;
+                let displacement_registers = if mode == 0b11 {
+                    0
+                } else {
+                    if regormem == 0b110 { 2 } else { mode }
+                };
+
+                for _ in 0..displacement_registers {
+                    bytes.push(reader.next_or_exit("add i-rm displ"));
+                }
+
+                for _ in 0..(w + 1 - s) {
+                    bytes.push(reader.next_or_exit("add i-rm data"));
+                }
+
+                process_irm(&bytes, bytes.len() as u8, opcode);
+            }
+            Opcode::AddIA | Opcode::SubIA | Opcode::CmpIA => {
+                let w = b0 & 0b1;
+                let mut bytes = vec![b0];
+
+                for _ in 0..w + 1 {
+                    bytes.push(reader.next_or_exit("mov i-r data"));
+                }
+
+                process_ir(&bytes, bytes.len() as u8, opcode);
+            }
+            Opcode::SubRmR | Opcode::AddRmR | Opcode::CmpRmR | Opcode::MovRmR => {
+                let mut bytes = vec![b0];
+                bytes.push(reader.next_or_exit("sub rm-r b[1]"));
 
                 let mode = bytes[1] >> 6;
                 let displacement_registers = if mode == 0b11 {
@@ -365,67 +152,39 @@ fn main() {
                 };
 
                 for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("add rm-r displ"));
+                    bytes.push(reader.next_or_exit("{} rm-r displ"));
                 }
 
-                process_rmr(&bytes, bytes.len() as u8, Opcode::AddRmR);
+                process_rmr(&bytes, bytes.len() as u8, opcode);
             }
-            Opcode::AddIRm => {
-                let w = b0 & 0b1;
-                let s = (b0 >> 1) & 0b1;
+            Opcode::Je
+            | Opcode::Jl
+            | Opcode::Jle
+            | Opcode::Jb
+            | Opcode::Jbe
+            | Opcode::Jp
+            | Opcode::Jo
+            | Opcode::Js
+            | Opcode::Jne
+            | Opcode::Jnl
+            | Opcode::Jg
+            | Opcode::Jnb
+            | Opcode::Ja
+            | Opcode::Jnp
+            | Opcode::Jno
+            | Opcode::Jns
+            | Opcode::Loop
+            | Opcode::Loopz
+            | Opcode::Loopnz
+            | Opcode::Jcxz => {
                 let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("add i-rm b[1]"));
 
-                let mode = bytes[1] >> 6;
-                let displacement_registers = if mode == 0b11 { 0 } else { mode };
+                bytes.push(reader.next_or_exit("jmp ip-inc8"));
 
-                for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("add i-rm displ"));
-                }
-
-                for _ in 0..(w + 1 - s) {
-                    bytes.push(reader.next_or_exit("add i-rm data"));
-                }
-
-                process_irm(&bytes, bytes.len() as u8, Opcode::AddIRm);
-            }
-            Opcode::AddIA => {
-                let w = b0 & 0b1;
-                let mut bytes = vec![b0];
-
-                for _ in 0..w + 1 {
-                    bytes.push(reader.next_or_exit("mov i-r data"));
-                }
-
-                process_ir(&bytes, bytes.len() as u8, Opcode::AddIA);
+                process_jmp(&bytes, bytes.len() as u8, opcode);
             }
         };
     }
-}
-
-fn debug_bytes(bytes: &[u8]) {
-    if DEBUG {
-        println!(
-            "Processing bytes: [{}]",
-            bytes
-                .iter()
-                .map(|b| format!("{:08b}", b))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-}
-
-fn read_file(path: &str) -> Result<Vec<u8>, String> {
-    fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", path, e))
-}
-
-fn retrieve_register(index: u8, w: u8) -> Result<Register, String> {
-    REGISTERS
-        .get(w as usize)
-        .and_then(|row| row.get(index as usize))
-        .copied()
-        .ok_or_else(|| format!("Invalid register index: {}", index).into())
 }
 
 fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
@@ -438,27 +197,60 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
     );
 
     let w = bytes[0] & 0b1;
-    let reg = bytes[1] & 0b111;
+    let reg = (bytes[1] >> 3) & 0b111;
     let mode = bytes[1] >> 6;
 
     let regormem = bytes[1] & 0b111;
+
+    let is_arithmetic = op == Opcode::AddIRm || op == Opcode::SubIRm || op == Opcode::CmpIRm;
+    let s = if is_arithmetic {
+        (bytes[0] >> 1) & 0b1
+    } else {
+        0
+    };
+
+    //println!("reg {:03b}, opcode: {}", reg, op);
+    let op = if op == Opcode::AddIRm {
+        match reg {
+            0b101 => Opcode::SubIRm,
+            0b000 => Opcode::AddIRm,
+            0b111 => Opcode::CmpIRm,
+            _ => panic!("Invalid reg for AddRmR: {}", regormem),
+        }
+    } else {
+        op
+    };
+
     match mode {
         0b00 => {
             // Immediate to memory
             assert!(
-                size == 4 || size == 3,
+                size == 4 || size == 3 || size == 5,
                 "Invalid size for {} irm mode im to mem: {}",
                 op,
                 size
             );
-            let dest = EACS[regormem as usize];
             let value = if size == 3 {
                 let _b = bytes[2] as i8;
                 _b as i16
             } else {
                 ((bytes[3] as i16) << 8) | (bytes[2] as i16)
             };
-            let size = if size == 3 { "byte" } else { "word" };
+            let dest = if regormem == 0b110 {
+                &value.to_string()
+            } else {
+                &EACS[regormem as usize].to_string()
+            };
+            let value = if size == 3 {
+                let _b = bytes[2] as i8;
+                _b as i16
+            } else if size == 5 {
+                let _b = bytes[4] as i8;
+                _b as i16
+            } else {
+                ((bytes[3] as i16) << 8) | (bytes[2] as i16)
+            };
+            let size = if size + s == 3 { "byte" } else { "word" };
             println!("{} [{}], {} {}", op, dest, size, value);
         }
 
@@ -492,7 +284,7 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
             );
             let dest = EACS[regormem as usize];
             let displacement = ((bytes[3] as i16) << 8) | (bytes[2] as i16);
-            let value = if op == Opcode::AddIRm {
+            let value = if is_arithmetic {
                 bytes[4] as i16
             } else {
                 ((bytes[5] as i16) << 8) | (bytes[4] as i16)
@@ -514,8 +306,8 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode) {
                 op,
                 size
             );
-            let dest = retrieve_register(reg, w).expect("Failed to get destination register");
-            let value = if op == Opcode::AddIRm {
+            let dest = retrieve_register(regormem, w).expect("Failed to get destination register");
+            let value = if is_arithmetic {
                 bytes[2] as i16
             } else {
                 ((bytes[2] as i16) << 8) | (bytes[1] as i16)
@@ -620,6 +412,14 @@ fn process_mov_am(bytes: &[u8], size: u8) {
     println!("mov [{}], ax", value);
 }
 
+fn process_jmp(bytes: &[u8], size: u8, op: Opcode) {
+    debug_bytes(bytes);
+    assert!(size == 2, "Invalid size for mov am: {}", size);
+
+    let value = bytes[1] as i8;
+    println!("{} {}", op, value);
+}
+
 fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
     debug_bytes(bytes);
     assert!(
@@ -629,7 +429,9 @@ fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
         size
     );
 
-    let w = if (op == Opcode::AddIA) {
+    let is_arithmetic = op == Opcode::AddIA || op == Opcode::SubIA || op == Opcode::CmpIA;
+
+    let w = if op == Opcode::AddIA {
         bytes[0] & 0b1
     } else {
         (bytes[0] >> 3) & 0b1
@@ -642,7 +444,7 @@ fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
         _b as i16
     };
 
-    let dest = if op == Opcode::AddIA {
+    let dest = if is_arithmetic {
         if size == 3 { "ax" } else { "al" }
     } else {
         &retrieve_register(reg, w)
@@ -651,23 +453,6 @@ fn process_ir(bytes: &[u8], size: u8, op: Opcode) {
     };
 
     println!("{} {}, {}", op, dest, value);
-}
-fn process_mov_ir(bytes: &[u8], size: u8) {
-    debug_bytes(bytes);
-    assert!(size == 3 || size == 2, "Invalid size for mov ir {}", size);
-
-    let w = (bytes[0] >> 3) & 0b1;
-    let reg = bytes[0] & 0b111;
-    let value = if size == 3 {
-        ((bytes[2] as i16) << 8) | (bytes[1] as i16)
-    } else {
-        let _b = bytes[1] as i8;
-        _b as i16
-    };
-
-    let dest = retrieve_register(reg, w).expect("Failed to get destination register");
-
-    println!("mov {}, {}", dest, value);
 }
 
 fn with_sign(n: i16) -> String {

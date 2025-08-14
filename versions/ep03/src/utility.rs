@@ -1,12 +1,8 @@
 use crate::opcodes::Opcode;
-use crate::registers::REGISTERS;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
-
-// Module-level DEBUG constant
-pub const DEBUG: bool = true;
 
 #[derive(Default)]
 pub struct BitTrie {
@@ -95,40 +91,21 @@ impl Iterator for Reader {
     }
 }
 
-pub fn debug(args: std::fmt::Arguments) {
-    if DEBUG {
-        println!("{}", args);
-    }
-}
-
 pub fn debug_bytes(bytes: &[u8]) {
-    debug(format_args!(
-        "; Processing bytes: [{}]",
-        bytes
-            .iter()
-            .map(|b| format!("{:08b}", b))
-            .collect::<Vec<_>>()
-            .join(", ")
-    ));
+    static DEBUG: bool = true;
+    if DEBUG {
+        println!(
+            "; Processing bytes: [{}]",
+            bytes
+                .iter()
+                .map(|b| format!("{:08b}", b))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 }
 
 pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
     use std::fs;
     fs::read(path).map_err(|e| format!("Failed to read file '{}': {}", path, e))
-}
-
-pub fn print_memory_16bit(mem: &[u8]) {
-    assert!(mem.len() % 2 == 0, "Memory length must be divisible by 2");
-
-    for (i, chunk) in mem.chunks(2).enumerate() {
-        println!("; R{i}: {:08b} {:08b}", chunk[1], chunk[0]);
-        //let word = u16::from_le_bytes([chunk[0], chunk[1]]);
-        //println!("R{i}: {:016b}", word);
-    }
-}
-
-pub fn print_memory_hex(mem: &[u8]) {
-    for (i, chunk) in mem.chunks(2).enumerate() {
-        println!("; {}: {:02x} {:02x}", REGISTERS[1][i], chunk[1], chunk[0]);
-    }
 }
