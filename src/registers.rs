@@ -19,6 +19,7 @@ pub enum Register {
     BP,
     SI,
     DI,
+    IP,
 }
 
 pub enum Flag {
@@ -47,6 +48,7 @@ impl fmt::Display for Register {
             Register::BP => "bp",
             Register::SI => "si",
             Register::DI => "di",
+            Register::IP => "ip",
         };
         write!(f, "{}", s)
     }
@@ -136,7 +138,8 @@ pub struct RegisterFile {
     bp: RegisterRow, // BP
     si: RegisterRow, // SI
     di: RegisterRow, // DI
-    flags: u8,       // FLAGS register
+    ip: RegisterRow,
+    flags: u8, // FLAGS register
 }
 
 impl RegisterFile {
@@ -150,6 +153,7 @@ impl RegisterFile {
             bp: RegisterRow::new(),
             si: RegisterRow::new(),
             di: RegisterRow::new(),
+            ip: RegisterRow::new(),
             flags: 0, // Initialize FLAGS to 0
         }
     }
@@ -173,6 +177,7 @@ impl RegisterFile {
             BP => self.bp.get(),
             SI => self.si.get(),
             DI => self.di.get(),
+            IP => self.ip.get(),
         }
     }
 
@@ -195,7 +200,15 @@ impl RegisterFile {
             BP => self.bp = RegisterRow::from_bytes(value.to_le_bytes()),
             SI => self.si = RegisterRow::from_bytes(value.to_le_bytes()),
             DI => self.di = RegisterRow::from_bytes(value.to_le_bytes()),
+            IP => self.ip = RegisterRow::from_bytes(value.to_le_bytes()),
         }
+    }
+
+    pub fn move_ip_by_n(&mut self, n: usize) {
+        let current_ip = self.ip.get() as i16;
+        let new_ip = current_ip + n as i16;
+        println!("; Moving IP from {} to {}", current_ip, new_ip);
+        self.ip = RegisterRow::from_bytes(new_ip.to_le_bytes());
     }
 
     fn set_flag(&mut self, flag: Flag) {

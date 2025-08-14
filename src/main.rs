@@ -1,5 +1,5 @@
 use core::panic;
-use std::{env, result};
+use std::env;
 
 mod opcodes;
 mod registers;
@@ -7,7 +7,7 @@ mod utility;
 
 use opcodes::{OPCODE_TRIE, Opcode};
 use registers::{EACS, RegisterFile, retrieve_register};
-use utility::{DEBUG, IteratorExt, Reader, debug_bytes, read_file};
+use utility::{DEBUG, debug_bytes, read_file};
 
 use crate::registers::Register;
 use crate::utility::{print_memory_16bit, print_memory_hex};
@@ -47,15 +47,22 @@ fn main() {
         }
     };
 
-    let mut reader = Reader::new(&path).unwrap_or_else(|e| {
-        eprintln!("Failed to create reader: {}", e);
-        std::process::exit(1);
-    });
-
     println!("; File read successfully, size: {} bytes", file.len());
 
-    while let Some(chunk) = reader.next() {
-        let b0 = chunk;
+    fn read_or_exit(file: &[u8], index: usize, context: &str) -> u8 {
+        *file.get(index).unwrap_or_else(|| {
+            eprintln!("Unexpected end of file while reading {}", context);
+            std::process::exit(1);
+        })
+    }
+
+    loop {
+        let ip = memory.get(Register::IP) as usize;
+        if ip >= file.len() {
+            break;
+        }
+
+        let b0 = read_or_exit(&file, ip, "opcode");
 
         let opcode = OPCODE_TRIE
             .match_bits(b0)
@@ -69,25 +76,25 @@ fn main() {
             Opcode::MovMA => {
                 let mut bytes = vec![b0];
 
-                bytes.push(reader.next_or_exit("mov m-a addr_lo"));
-                bytes.push(reader.next_or_exit("mov m-a addr_hi"));
+                bytes.push(read_or_exit(&file, ip + bytes.len(), "mov m-a addr_lo"));
+                bytes.push(read_or_exit(&file, ip + bytes.len(), "mov m-a addr_hi"));
 
-                process_mov_ma(&bytes, bytes.len() as u8);
+                process_mov_ma(&bytes, bytes.len() as u8, &mut memory);
             }
             Opcode::MovAM => {
                 let mut bytes = vec![b0];
 
-                bytes.push(reader.next_or_exit("mov a-m addr_lo"));
-                bytes.push(reader.next_or_exit("mov a-m addr_hi"));
+                bytes.push(read_or_exit(&file, ip + bytes.len(), "mov a-m addr_lo"));
+                bytes.push(read_or_exit(&file, ip + bytes.len(), "mov a-m addr_hi"));
 
-                process_mov_am(&bytes, bytes.len() as u8);
+                process_mov_am(&bytes, bytes.len() as u8, &mut memory);
             }
             Opcode::MovIR => {
                 let w = (b0 >> 3) & 0b1;
                 let mut bytes = vec![b0];
 
                 for _ in 0..w + 1 {
-                    bytes.push(reader.next_or_exit("mov i-r data"));
+                    bytes.push(read_or_exit(&file, ip + bytes.len(), "mov i-r data"));
                 }
 
                 process_ir(&bytes, bytes.len() as u8, Opcode::MovIR, &mut memory);
@@ -95,17 +102,17 @@ fn main() {
             Opcode::MovIRm => {
                 let w = b0 & 0b1;
                 let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("mov i-rm b[1]"));
+                bytes.push(read_or_exit(&file, ip + bytes.len(), "mov i-rm b[1]"));
 
                 let mode = bytes[1] >> 6;
                 let displacement_registers = if mode == 0b11 { 0 } else { mode };
 
                 for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("mov i-rm displ"));
+                    bytes.push(read_or_exit(&file, ip + bytes.len(), "mov i-rm displ"));
                 }
 
                 for _ in 0..w + 1 {
-                    bytes.push(reader.next_or_exit("mov i-rm data"));
+                    bytes.push(read_or_exit(&file, ip + bytes.len(), "mov i-rm data"));
                 }
 
                 process_irm(&bytes, bytes.len() as u8, Opcode::MovIRm, &mut memory);
@@ -114,7 +121,7 @@ fn main() {
                 let w = b0 & 0b1;
                 let s = (b0 >> 1) & 0b1;
                 let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("add i-rm b[1]"));
+                bytes.push(read_or_exit(&file, ip + bytes.len(), "add i-rm b[1]"));
 
                 let regormem = bytes[1] & 0b111;
 
@@ -126,11 +133,11 @@ fn main() {
                 };
 
                 for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("add i-rm displ"));
+                    bytes.push(read_or_exit(&file, ip + bytes.len(), "add i-rm displ"));
                 }
 
                 for _ in 0..(w + 1 - s) {
-                    bytes.push(reader.next_or_exit("add i-rm data"));
+                    bytes.push(read_or_exit(&file, ip + bytes.len(), "add i-rm data"));
                 }
 
                 process_irm(&bytes, bytes.len() as u8, opcode, &mut memory);
@@ -140,14 +147,14 @@ fn main() {
                 let mut bytes = vec![b0];
 
                 for _ in 0..w + 1 {
-                    bytes.push(reader.next_or_exit("mov i-r data"));
+                    bytes.push(read_or_exit(&file, ip + bytes.len(), "mov i-r data"));
                 }
 
                 process_ir(&bytes, bytes.len() as u8, opcode, &mut memory);
             }
             Opcode::SubRmR | Opcode::AddRmR | Opcode::CmpRmR | Opcode::MovRmR => {
                 let mut bytes = vec![b0];
-                bytes.push(reader.next_or_exit("sub rm-r b[1]"));
+                bytes.push(read_or_exit(&file, ip + bytes.len(), "sub rm-r b[1]"));
 
                 let mode = bytes[1] >> 6;
                 let displacement_registers = if mode == 0b11 {
@@ -162,7 +169,7 @@ fn main() {
                 };
 
                 for _ in 0..displacement_registers {
-                    bytes.push(reader.next_or_exit("{} rm-r displ"));
+                    bytes.push(read_or_exit(&file, ip + bytes.len(), "{} rm-r displ"));
                 }
 
                 process_rmr(&bytes, bytes.len() as u8, opcode, &mut memory);
@@ -189,9 +196,9 @@ fn main() {
             | Opcode::Jcxz => {
                 let mut bytes = vec![b0];
 
-                bytes.push(reader.next_or_exit("jmp ip-inc8"));
+                bytes.push(read_or_exit(&file, ip + bytes.len(), "jmp ip-inc8"));
 
-                process_jmp(&bytes, bytes.len() as u8, opcode);
+                process_jmp(&bytes, bytes.len() as u8, opcode, &mut memory);
             }
         };
         println!();
@@ -199,6 +206,7 @@ fn main() {
 }
 
 fn process_irm(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
+    memory.move_ip_by_n(bytes.len());
     debug!("; Processing irm:");
     debug_bytes(bytes);
     assert!(
@@ -346,6 +354,7 @@ fn process_irm(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
 }
 
 fn process_rmr(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
+    memory.move_ip_by_n(bytes.len());
     debug!("; Processing rmr:");
     debug_bytes(bytes);
     assert!(
@@ -429,7 +438,8 @@ fn process_rmr(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
     }
 }
 
-fn process_mov_ma(bytes: &[u8], size: u8) {
+fn process_mov_ma(bytes: &[u8], size: u8, memory: &mut RegisterFile) {
+    memory.move_ip_by_n(bytes.len());
     debug!("; Processing mov ma:");
     debug_bytes(bytes);
     assert!(size == 3, "Invalid size for mov ma: {}", size);
@@ -438,7 +448,8 @@ fn process_mov_ma(bytes: &[u8], size: u8) {
     println!("mov ax, [{}]", value);
 }
 
-fn process_mov_am(bytes: &[u8], size: u8) {
+fn process_mov_am(bytes: &[u8], size: u8, memory: &mut RegisterFile) {
+    memory.move_ip_by_n(bytes.len());
     debug!("; Processing mov am:");
     debug_bytes(bytes);
     assert!(size == 3, "Invalid size for mov am: {}", size);
@@ -447,15 +458,28 @@ fn process_mov_am(bytes: &[u8], size: u8) {
     println!("mov [{}], ax", value);
 }
 
-fn process_jmp(bytes: &[u8], size: u8, op: Opcode) {
+fn process_jmp(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
+    memory.move_ip_by_n(bytes.len());
     debug_bytes(bytes);
-    assert!(size == 2, "Invalid size for mov am: {}", size);
+    assert!(size == 2, "Invalid size for jmp: {}", size);
 
     let value = bytes[1] as i8;
+    match op {
+        Opcode::Jne => {
+            if !memory.get_flag(registers::Flag::Zero) {
+                memory.move_ip_by_n(value as usize);
+            }
+        }
+
+        _ => {
+            panic!("Unsupported jump opcode: {:?}", op);
+        }
+    }
     println!("{} {}", op, value);
 }
 
 fn process_ir(bytes: &[u8], size: u8, op: Opcode, memory: &mut RegisterFile) {
+    memory.move_ip_by_n(bytes.len());
     debug!("; Processing ir:");
     debug_bytes(bytes);
     assert!(
